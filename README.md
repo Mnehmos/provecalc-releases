@@ -1,0 +1,1 @@
+# ProveCalc Releases\n\nDownload the latest ProveCalc desktop app from the [Releases](https://github.com/Mnehmos/provecalc-releases/releases) page.\n\nPurchase a license at [provecalc.com](https://provecalc.com).
