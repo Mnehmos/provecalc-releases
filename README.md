@@ -4,6 +4,10 @@ Download the latest ProveCalc desktop app from the
 [Releases](https://github.com/Mnehmos/provecalc-releases/releases/latest) page.
 Purchase a license at [provecalc.com](https://provecalc.com).
 
+Maintainers: see [RELEASING.md](RELEASING.md) for the signed release workflow
+and its one-time credential setup. Published downloads change only after the
+complete release passes validation.
+
 ## Which file do I need?
 
 | Platform | Download |
