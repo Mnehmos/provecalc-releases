@@ -1,0 +1,629 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: 'Full 40-character commit from the private app master branch'
+        type: string
+        required: true
+      source_tag:
+        description: 'Matching numeric release tag, for example v0.1.10-1'
+        type: string
+        required: true
+      publish:
+        description: 'Publish only after complete signed asset validation'
+        type: boolean
+        default: false
+
+env:
+  SOURCE_SHA: ${{ inputs.source_sha }}
+  SOURCE_TAG: ${{ inputs.source_tag }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provecalc-release-${{ inputs.source_tag }}
+  cancel-in-progress: true
+
+jobs:
+  source-identity:
+    if: github.ref == 'refs/heads/main'
+    environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate configuration and immutable source inputs
+        env:
+          SOURCE_ACCESS_CONFIGURED: ${{ secrets.SOURCE_REPO_TOKEN != '' }}
+          SIGNING_KEY_CONFIGURED: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+          SIGNING_PASSWORD_CONFIGURED: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          for name in ['SOURCE_ACCESS_CONFIGURED', 'SIGNING_KEY_CONFIGURED', 'SIGNING_PASSWORD_CONFIGURED']:
+              if os.environ[name] != 'true':
+                  raise SystemExit('Release credentials are not configured; no build or publication started.')
+          if not re.fullmatch(r'[0-9a-f]{40}', os.environ['SOURCE_SHA']):
+              raise SystemExit('source_sha must be a full lowercase commit SHA.')
+          if not re.fullmatch(r'v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))?', os.environ['SOURCE_TAG']):
+              raise SystemExit('source_tag must be a numeric MSI-compatible release tag.')
+          PY
+      - name: Fetch the private source without persisting credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Mnehmos/mnehmos.worksheet.app
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Bind the release tag to the reviewed master commit
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse "refs/tags/$SOURCE_TAG^{commit}")" = "$SOURCE_SHA"
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/master
+
+  release-checks:
+    environment: release
+    name: Release Consistency
+    needs: [source-identity]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Mnehmos/mnehmos.worksheet.app
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Require the tagged commit on master
+        run: |
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/master
+
+      - name: Check versions, Tauri packages, updater signing, and notes
+        run: python3 scripts/check_release_consistency.py --tag "${{ inputs.source_tag }}"
+
+  frontend-tests:
+    environment: release
+    name: Frontend Tests
+    needs: [source-identity]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Mnehmos/mnehmos.worksheet.app
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build production frontend
+        run: npm run build
+
+      - name: Run tests with coverage
+        run: npm run test:coverage
+
+      - name: Test observability MCP pairing
+        run: npm run test:mcp
+
+  rust-tests:
+    environment: release
+    name: Rust Tests
+    needs: [source-identity]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Mnehmos/mnehmos.worksheet.app
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@9423510f11512992cb6c790b35e139796f7ac612 # 1.90.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xvfb xauth dbus-x11
+
+      - name: Stub sidecar binary for build.rs externalBin path check
+        # Tauri validates externalBin paths at compile time. The real
+        # bundle is built in the build matrix below; a stub suffices
+        # for library-only tests.
+        run: |
+          mkdir -p src-tauri/binaries
+          touch src-tauri/binaries/provecalc-sidecar-x86_64-unknown-linux-gnu
+          chmod +x src-tauri/binaries/provecalc-sidecar-x86_64-unknown-linux-gnu
+
+      - name: Stub frontend distribution for Tauri compile-time check
+        run: |
+          mkdir -p dist
+          touch dist/index.html
+
+      - name: Check Rust formatting
+        working-directory: src-tauri
+        run: cargo fmt --all --check
+
+      - name: Run Clippy with warnings denied
+        working-directory: src-tauri
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run Rust tests
+        # Unit, disk round-trip, and documentation tests.
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Install locked cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit Rust dependencies
+        # Known vulnerabilities are release-blocking; the nightly audit can
+        # go red between releases without anyone looking at it.
+        working-directory: src-tauri
+        run: cargo audit
+
+  python-tests:
+    environment: release
+    name: Python Tests
+    needs: [source-identity]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Mnehmos/mnehmos.worksheet.app
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup uv and supported Python
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: '0.12.20'
+          python-version: '3.12.13'
+          activate-environment: true
+          no-project: true
+          enable-cache: true
+          cache-python: true
+
+      - name: Install dependencies
+        run: uv pip install --require-hashes -r sidecar/requirements-dev.txt
+
+      - name: Check dependency consistency
+        run: uv pip check
+
+      - name: Run Ruff
+        working-directory: sidecar
+        run: python -m ruff check .
+
+      - name: Run Mypy
+        working-directory: sidecar
+        run: python -m mypy
+
+      - name: Run Python tests
+        working-directory: sidecar
+        run: python -m pytest tests/ -v --tb=short
+
+  create-release:
+    name: Create Draft Release
+    needs: [release-checks, frontend-tests, rust-tests, python-tests]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.draft.outputs.release_id }}
+    steps:
+      - name: Create a fresh draft release in provecalc-releases
+        id: draft
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.source_tag }}"
+          # The release stays a draft until every platform is built, signed,
+          # and listed in latest.json. Installed apps follow
+          # releases/latest, so publishing earlier would serve them a
+          # release without a complete updater manifest.
+          # Never build into a published release, and never append to an old
+          # draft: its assets may come from another commit or attempt. A
+          # rerun of this job recreates the draft; rerunning only failed
+          # build jobs keeps this job's draft.
+          if gh release view "$TAG" --repo Mnehmos/provecalc-releases >/dev/null 2>&1; then
+            IS_DRAFT=$(gh release view "$TAG" \
+              --repo Mnehmos/provecalc-releases \
+              --json isDraft --jq '.isDraft')
+            if [[ "$IS_DRAFT" != "true" ]]; then
+              echo "Release $TAG is already public; refusing to reuse it." >&2
+              exit 1
+            fi
+            gh release delete "$TAG" \
+              --repo Mnehmos/provecalc-releases \
+              --cleanup-tag=false \
+              --yes
+          fi
+          gh release create "$TAG" \
+            --repo Mnehmos/provecalc-releases \
+            --title "ProveCalc $TAG" \
+            --notes "Release in progress." \
+            --target main \
+            --draft
+          RELEASE_ID=$(gh release view "$TAG" \
+            --repo Mnehmos/provecalc-releases \
+            --json databaseId \
+            --jq .databaseId)
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+
+  build:
+    permissions:
+      contents: write
+    needs: [create-release]
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: ''
+            arch: x86_64
+            rust-target: x86_64-pc-windows-msvc
+            updater-platform: windows-x86_64
+            bundle-dir: src-tauri/target/release/bundle
+          - platform: macos-15
+            args: '--target aarch64-apple-darwin'
+            arch: aarch64
+            rust-target: aarch64-apple-darwin
+            updater-platform: darwin-aarch64
+            bundle-dir: src-tauri/target/aarch64-apple-darwin/release/bundle
+          - platform: macos-15-intel
+            args: '--target x86_64-apple-darwin'
+            arch: x86_64
+            rust-target: x86_64-apple-darwin
+            updater-platform: darwin-x86_64
+            bundle-dir: src-tauri/target/x86_64-apple-darwin/release/bundle
+          - platform: ubuntu-22.04
+            args: ''
+            arch: x86_64
+            rust-target: x86_64-unknown-linux-gnu
+            updater-platform: linux-x86_64
+            bundle-dir: src-tauri/target/release/bundle
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Mnehmos/mnehmos.worksheet.app
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@9423510f11512992cb6c790b35e139796f7ac612 # 1.90.0
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Install dependencies (Ubuntu)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xvfb xauth dbus-x11
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Setup uv and supported Python
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: '0.12.20'
+          python-version: '3.12.13'
+          activate-environment: true
+          no-project: true
+          enable-cache: true
+          cache-python: true
+
+      - name: Install sidecar dependencies
+        run: uv pip install --require-hashes -r sidecar/requirements-build.txt
+
+      - name: Check sidecar dependency consistency
+        run: uv pip check
+
+      - name: Verify Python host architecture matches the bundled engine target
+        shell: bash
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          python - <<'PY'
+          import os, platform
+          actual = platform.machine().lower()
+          actual = {'amd64': 'x86_64', 'arm64': 'aarch64'}.get(actual, actual)
+          if actual != os.environ['EXPECTED_ARCH']:
+              raise SystemExit('The Python engine host does not match the installer architecture.')
+          PY
+
+      - name: Build bundled sidecar binary (PyInstaller)
+        shell: bash
+        working-directory: sidecar
+        run: |
+          python -m PyInstaller provecalc-sidecar.spec --distpath ../src-tauri/binaries --clean -y
+
+      - name: Rename sidecar binary to Rust target triple
+        shell: bash
+        run: |
+          set -e
+          BIN_DIR="src-tauri/binaries"
+          TRIPLE="${{ matrix.rust-target }}"
+          if [ "${{ matrix.platform }}" = "windows-latest" ]; then
+            mv "$BIN_DIR/provecalc-sidecar.exe" "$BIN_DIR/provecalc-sidecar-${TRIPLE}.exe"
+          else
+            mv "$BIN_DIR/provecalc-sidecar" "$BIN_DIR/provecalc-sidecar-${TRIPLE}"
+            chmod +x "$BIN_DIR/provecalc-sidecar-${TRIPLE}"
+          fi
+          ls -la "$BIN_DIR"
+
+      - name: Smoke-test the actual frozen engine before bundling
+        shell: bash
+        env:
+          ENGINE_TARGET: ${{ matrix.rust-target }}
+          ENGINE_OS: ${{ matrix.platform }}
+        run: |
+          suffix=''
+          if [[ "$ENGINE_OS" == windows-* ]]; then suffix='.exe'; fi
+          python scripts/smoke_frozen_sidecar.py --binary "src-tauri/binaries/provecalc-sidecar-${ENGINE_TARGET}${suffix}"
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          owner: Mnehmos
+          repo: provecalc-releases
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          # latest.json is generated once, after every platform is signed.
+          includeUpdaterJson: false
+          args: ${{ matrix.args }}
+
+      - name: Smoke-test the packaged Linux application and engine cleanup
+        if: matrix.updater-platform == 'linux-x86_64'
+        run: xvfb-run -a dbus-run-session python scripts/smoke_packaged_app.py --app src-tauri/target/release/provecalc
+
+      - name: Stage and upload signed updater artifacts
+        # Fails when an updater artifact or its signature is missing. The
+        # previous per-OS steps skipped silently, which is how v0.1.5-v0.1.7
+        # shipped an updater manifest with no platforms.
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python scripts/updater_release.py stage \
+            --platform "${{ matrix.updater-platform }}" \
+            --bundle-dir "${{ matrix.bundle-dir }}" \
+            --out updater-assets
+          gh release upload "${{ inputs.source_tag }}" updater-assets/* \
+            --repo Mnehmos/provecalc-releases \
+            --clobber
+
+  publish-metadata:
+    permissions:
+      contents: write
+    name: Publish SBOM and Provenance
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 10
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Mnehmos/mnehmos.worksheet.app
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Generate release-revision SPDX SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          path: .
+          format: spdx-json
+          output-file: release-sbom.spdx.json
+          syft-version: v1.42.3
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Validate SBOM and download published artifacts
+        shell: bash
+        env:
+          PUBLIC_RELEASE_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.source_tag }}"
+          VERSION="${TAG#v}"
+          mkdir -p release-assets
+
+          GH_TOKEN="$PUBLIC_RELEASE_TOKEN" gh release download "$TAG" \
+            --repo Mnehmos/provecalc-releases \
+            --pattern 'ProveCalc*' \
+            --dir release-assets
+
+          # A rerun may download metadata from an earlier attempt. Remove only
+          # those generated files before hashing the published app artifacts.
+          find release-assets -maxdepth 1 -type f \
+            \( -name 'ProveCalc_*_SHA256SUMS.txt' \
+               -o -name 'ProveCalc_*_provenance.intoto.json' \
+               -o -name 'ProveCalc_*_sbom.spdx.json' \) \
+            -delete
+
+          SBOM_PATH="release-assets/ProveCalc_${VERSION}_sbom.spdx.json"
+          python scripts/validate_spdx_sbom.py \
+            --path release-sbom.spdx.json \
+            --expected-syft-version 1.42.3
+          mv release-sbom.spdx.json "$SBOM_PATH"
+
+      - name: Generate checksums and source provenance
+        run: |
+          TAG="${{ inputs.source_tag }}"
+          python scripts/generate_release_provenance.py \
+            --artifacts-dir release-assets \
+            --output-dir release-metadata \
+            --version "${TAG#v}" \
+            --source-revision "$SOURCE_SHA" \
+            --source-ref "refs/tags/$SOURCE_TAG" \
+            --repository "Mnehmos/mnehmos.worksheet.app" \
+            --builder-repository "$GITHUB_REPOSITORY" \
+            --workflow-ref "$GITHUB_WORKFLOW_REF" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Upload release security metadata
+        shell: bash
+        env:
+          PUBLIC_RELEASE_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.source_tag }}"
+          VERSION="${TAG#v}"
+          GH_TOKEN="$PUBLIC_RELEASE_TOKEN" gh release upload "$TAG" \
+            "release-assets/ProveCalc_${VERSION}_sbom.spdx.json" \
+            "release-metadata/ProveCalc_${VERSION}_provenance.intoto.json" \
+            "release-metadata/ProveCalc_${VERSION}_SHA256SUMS.txt" \
+            --repo Mnehmos/provecalc-releases \
+            --clobber
+
+  publish-release:
+    permissions:
+      contents: write
+    name: Publish Updater Manifest and Release
+    needs: [build, publish-metadata]
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 20
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Mnehmos/mnehmos.worksheet.app
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Generate latest.json from the signed artifacts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.source_tag }}"
+          mkdir -p signatures
+          gh release download "$TAG" \
+            --repo Mnehmos/provecalc-releases \
+            --pattern 'ProveCalc_*.sig' \
+            --dir signatures
+          python3 scripts/updater_release.py manifest \
+            --version "${TAG#v}" \
+            --base-url "https://github.com/Mnehmos/provecalc-releases/releases/download/${TAG}" \
+            --signatures-dir signatures \
+            --changelog CHANGELOG.md \
+            --output latest.json \
+            --notes-output release-notes.md
+
+      - name: Upload latest.json to the draft
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "${{ inputs.source_tag }}" latest.json \
+            --repo Mnehmos/provecalc-releases \
+            --clobber
+
+      - name: Install minisign for updater signature verification
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      - name: Validate the complete draft before publishing
+        # Re-verifies what customers will download: every updater artifact
+        # against the public key the installed apps trust, latest.json, the
+        # installer inventory, checksums, and provenance for this run.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.source_tag }}"
+          gh release view "$TAG" \
+            --repo Mnehmos/provecalc-releases \
+            --json isDraft,assets > release-assets.json
+          if [[ "$(jq -r '.isDraft' release-assets.json)" != "true" ]]; then
+            echo "Release $TAG is no longer a draft at the publication gate." >&2
+            exit 1
+          fi
+          mkdir -p release-assets
+          gh release download "$TAG" \
+            --repo Mnehmos/provecalc-releases \
+            --pattern 'ProveCalc*' \
+            --pattern 'latest.json' \
+            --dir release-assets
+          python3 -c "import base64,json,pathlib; pathlib.Path('updater.pub').write_bytes(base64.b64decode(json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text())['plugins']['updater']['pubkey']))"
+          python3 scripts/validate_release_assets.py \
+            --asset-json release-assets.json \
+            --assets-dir release-assets \
+            --version "${TAG#v}" \
+            --source-sha "$SOURCE_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --updater-public-key updater.pub
+
+      - name: Publish the release
+        if: inputs.publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.source_tag }}"
+          # Publishing last means releases/latest, and therefore every
+          # installed updater, only moves once the manifest is complete.
+          # Tags with a pre-release suffix (v0.1.8-1) publish as
+          # pre-releases, which releases/latest ignores, so a candidate can
+          # be verified without offering it to installed apps.
+          if [[ "$TAG" == *-* ]]; then
+            channel=(--prerelease --latest=false)
+          else
+            channel=(--prerelease=false --latest)
+          fi
+          gh release edit "$TAG" \
+            --repo Mnehmos/provecalc-releases \
+            --notes-file release-notes.md \
+            --draft=false \
+            "${channel[@]}"
