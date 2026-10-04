@@ -11,14 +11,15 @@ on:
         description: 'Matching numeric release tag, for example v0.1.10-1'
         type: string
         required: true
-      publish:
-        description: 'Publish only after complete signed asset validation'
-        type: boolean
-        default: false
+      source_capsule_sha256:
+        description: 'SHA-256 of the encrypted source capsule staged in the draft'
+        type: string
+        required: true
 
 env:
   SOURCE_SHA: ${{ inputs.source_sha }}
   SOURCE_TAG: ${{ inputs.source_tag }}
+  SOURCE_CAPSULE_SHA256: ${{ inputs.source_capsule_sha256 }}
 
 permissions:
   contents: read
@@ -34,36 +35,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Validate configuration and immutable source inputs
-        env:
-          SOURCE_ACCESS_CONFIGURED: ${{ secrets.SOURCE_REPO_TOKEN != '' }}
-          SIGNING_KEY_CONFIGURED: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
-          SIGNING_PASSWORD_CONFIGURED: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' }}
+      - name: Validate source inputs
         run: |
           python3 - <<'PY'
           import os, re
-          for name in ['SOURCE_ACCESS_CONFIGURED', 'SIGNING_KEY_CONFIGURED', 'SIGNING_PASSWORD_CONFIGURED']:
-              if os.environ[name] != 'true':
-                  raise SystemExit('Release credentials are not configured; no build or publication started.')
-          if not re.fullmatch(r'[0-9a-f]{40}', os.environ['SOURCE_SHA']):
-              raise SystemExit('source_sha must be a full lowercase commit SHA.')
-          if not re.fullmatch(r'v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))?', os.environ['SOURCE_TAG']):
-              raise SystemExit('source_tag must be a numeric MSI-compatible release tag.')
+          for name, pattern in [('SOURCE_SHA', r'[0-9a-f]{40}'), ('SOURCE_CAPSULE_SHA256', r'[0-9a-f]{64}'), ('SOURCE_TAG', r'v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))?')]:
+              if not re.fullmatch(pattern, os.environ[name]):
+                  raise SystemExit('Invalid immutable source input.')
           PY
-      - name: Fetch the private source without persisting credentials
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: Mnehmos/mnehmos.worksheet.app
-          ref: ${{ inputs.source_sha }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
           persist-credentials: false
-          fetch-depth: 0
-      - name: Bind the release tag to the reviewed master commit
+      - name: Load the encrypted reviewed source capsule
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ARCHIVE_KEY: ${{ secrets.SOURCE_ARCHIVE_KEY }}
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test "$(git rev-parse "refs/tags/$SOURCE_TAG^{commit}")" = "$SOURCE_SHA"
-          git merge-base --is-ancestor "$SOURCE_SHA" origin/master
+          mkdir -p "$RUNNER_TEMP/source-capsule"
+          gh release download "$SOURCE_TAG" --repo Mnehmos/provecalc-releases --pattern Source.enc --dir "$RUNNER_TEMP/source-capsule"
+          python scripts/decrypt_release_source.py --capsule "$RUNNER_TEMP/source-capsule/Source.enc" --sha256 "$SOURCE_CAPSULE_SHA256" --source-sha "$SOURCE_SHA"
 
   release-checks:
     environment: release
@@ -74,18 +66,23 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: Mnehmos/mnehmos.worksheet.app
-          ref: ${{ inputs.source_sha }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
           persist-credentials: false
-          fetch-depth: 0
-
-      - name: Require the tagged commit on master
+      - name: Load the encrypted reviewed source capsule
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ARCHIVE_KEY: ${{ secrets.SOURCE_ARCHIVE_KEY }}
         run: |
-          git merge-base --is-ancestor "$SOURCE_SHA" origin/master
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source-capsule"
+          gh release download "$SOURCE_TAG" --repo Mnehmos/provecalc-releases --pattern Source.enc --dir "$RUNNER_TEMP/source-capsule"
+          python scripts/decrypt_release_source.py --capsule "$RUNNER_TEMP/source-capsule/Source.enc" --sha256 "$SOURCE_CAPSULE_SHA256" --source-sha "$SOURCE_SHA"
 
       - name: Check versions, Tauri packages, updater signing, and notes
         run: python3 scripts/check_release_consistency.py --tag "${{ inputs.source_tag }}"
+
+      - name: Check release tooling and native command registration
+        run: python3 -m unittest discover -s scripts/tests
 
   frontend-tests:
     environment: release
@@ -95,11 +92,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: Mnehmos/mnehmos.worksheet.app
-          ref: ${{ inputs.source_sha }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
           persist-credentials: false
-          fetch-depth: 0
+      - name: Load the encrypted reviewed source capsule
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ARCHIVE_KEY: ${{ secrets.SOURCE_ARCHIVE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source-capsule"
+          gh release download "$SOURCE_TAG" --repo Mnehmos/provecalc-releases --pattern Source.enc --dir "$RUNNER_TEMP/source-capsule"
+          python scripts/decrypt_release_source.py --capsule "$RUNNER_TEMP/source-capsule/Source.enc" --sha256 "$SOURCE_CAPSULE_SHA256" --source-sha "$SOURCE_SHA"
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -133,11 +136,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: Mnehmos/mnehmos.worksheet.app
-          ref: ${{ inputs.source_sha }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
           persist-credentials: false
-          fetch-depth: 0
+      - name: Load the encrypted reviewed source capsule
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ARCHIVE_KEY: ${{ secrets.SOURCE_ARCHIVE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source-capsule"
+          gh release download "$SOURCE_TAG" --repo Mnehmos/provecalc-releases --pattern Source.enc --dir "$RUNNER_TEMP/source-capsule"
+          python scripts/decrypt_release_source.py --capsule "$RUNNER_TEMP/source-capsule/Source.enc" --sha256 "$SOURCE_CAPSULE_SHA256" --source-sha "$SOURCE_SHA"
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@9423510f11512992cb6c790b35e139796f7ac612 # 1.90.0
@@ -193,11 +202,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: Mnehmos/mnehmos.worksheet.app
-          ref: ${{ inputs.source_sha }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
           persist-credentials: false
-          fetch-depth: 0
+      - name: Load the encrypted reviewed source capsule
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ARCHIVE_KEY: ${{ secrets.SOURCE_ARCHIVE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source-capsule"
+          gh release download "$SOURCE_TAG" --repo Mnehmos/provecalc-releases --pattern Source.enc --dir "$RUNNER_TEMP/source-capsule"
+          python scripts/decrypt_release_source.py --capsule "$RUNNER_TEMP/source-capsule/Source.enc" --sha256 "$SOURCE_CAPSULE_SHA256" --source-sha "$SOURCE_SHA"
 
       - name: Setup uv and supported Python
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
@@ -237,44 +252,14 @@ jobs:
     outputs:
       release_id: ${{ steps.draft.outputs.release_id }}
     steps:
-      - name: Create a fresh draft release in provecalc-releases
+      - name: Require the capsule's existing unpublished draft
         id: draft
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.source_tag }}"
-          # The release stays a draft until every platform is built, signed,
-          # and listed in latest.json. Installed apps follow
-          # releases/latest, so publishing earlier would serve them a
-          # release without a complete updater manifest.
-          # Never build into a published release, and never append to an old
-          # draft: its assets may come from another commit or attempt. A
-          # rerun of this job recreates the draft; rerunning only failed
-          # build jobs keeps this job's draft.
-          if gh release view "$TAG" --repo Mnehmos/provecalc-releases >/dev/null 2>&1; then
-            IS_DRAFT=$(gh release view "$TAG" \
-              --repo Mnehmos/provecalc-releases \
-              --json isDraft --jq '.isDraft')
-            if [[ "$IS_DRAFT" != "true" ]]; then
-              echo "Release $TAG is already public; refusing to reuse it." >&2
-              exit 1
-            fi
-            gh release delete "$TAG" \
-              --repo Mnehmos/provecalc-releases \
-              --cleanup-tag=false \
-              --yes
-          fi
-          gh release create "$TAG" \
-            --repo Mnehmos/provecalc-releases \
-            --title "ProveCalc $TAG" \
-            --notes "Release in progress." \
-            --target main \
-            --draft
-          RELEASE_ID=$(gh release view "$TAG" \
-            --repo Mnehmos/provecalc-releases \
-            --json databaseId \
-            --jq .databaseId)
+          test "$(gh release view "$SOURCE_TAG" --repo Mnehmos/provecalc-releases --json isDraft --jq .isDraft)" = true
+          RELEASE_ID=$(gh release view "$SOURCE_TAG" --repo Mnehmos/provecalc-releases --json databaseId --jq .databaseId)
           echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
 
   build:
@@ -316,11 +301,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: Mnehmos/mnehmos.worksheet.app
-          ref: ${{ inputs.source_sha }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
           persist-credentials: false
-          fetch-depth: 0
+      - name: Load the encrypted reviewed source capsule
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ARCHIVE_KEY: ${{ secrets.SOURCE_ARCHIVE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source-capsule"
+          gh release download "$SOURCE_TAG" --repo Mnehmos/provecalc-releases --pattern Source.enc --dir "$RUNNER_TEMP/source-capsule"
+          python scripts/decrypt_release_source.py --capsule "$RUNNER_TEMP/source-capsule/Source.enc" --sha256 "$SOURCE_CAPSULE_SHA256" --source-sha "$SOURCE_SHA"
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@9423510f11512992cb6c790b35e139796f7ac612 # 1.90.0
@@ -400,40 +391,33 @@ jobs:
           if [[ "$ENGINE_OS" == windows-* ]]; then suffix='.exe'; fi
           python scripts/smoke_frozen_sidecar.py --binary "src-tauri/binaries/provecalc-sidecar-${ENGINE_TARGET}${suffix}"
 
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
+      - name: Build unsigned installers into the draft
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          owner: Mnehmos
-          repo: provecalc-releases
-          releaseId: ${{ needs.create-release.outputs.release_id }}
-          # latest.json is generated once, after every platform is signed.
-          includeUpdaterJson: false
-          args: ${{ matrix.args }}
+          BUILD_ARGS: ${{ matrix.args }}
+          BUNDLE_DIR: ${{ matrix.bundle-dir }}
+          BUILD_PLATFORM: ${{ matrix.updater-platform }}
+        run: |
+          set -euo pipefail
+          npx tauri build $BUILD_ARGS --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          if [[ "$BUILD_PLATFORM" == darwin-* ]]; then
+            tar -czf "$BUNDLE_DIR/macos/ProveCalc.app.tar.gz" -C "$BUNDLE_DIR/macos" ProveCalc.app
+          fi
 
       - name: Smoke-test the packaged Linux application and engine cleanup
         if: matrix.updater-platform == 'linux-x86_64'
         run: xvfb-run -a dbus-run-session python scripts/smoke_packaged_app.py --app src-tauri/target/release/provecalc
 
-      - name: Stage and upload signed updater artifacts
-        # Fails when an updater artifact or its signature is missing. The
-        # previous per-OS steps skipped silently, which is how v0.1.5-v0.1.7
-        # shipped an updater manifest with no platforms.
+      - name: Stage and upload unsigned draft artifacts
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_DIR: ${{ matrix.bundle-dir }}
+          BUILD_PLATFORM: ${{ matrix.updater-platform }}
         run: |
           set -euo pipefail
-          python scripts/updater_release.py stage \
-            --platform "${{ matrix.updater-platform }}" \
-            --bundle-dir "${{ matrix.bundle-dir }}" \
-            --out updater-assets
-          gh release upload "${{ inputs.source_tag }}" updater-assets/* \
-            --repo Mnehmos/provecalc-releases \
-            --clobber
+          python scripts/stage_unsigned_release.py --platform "$BUILD_PLATFORM" --bundle "$BUNDLE_DIR" --out unsigned-assets
+          gh release upload "$SOURCE_TAG" unsigned-assets/* --repo Mnehmos/provecalc-releases --clobber
 
   publish-metadata:
     permissions:
@@ -447,11 +431,17 @@ jobs:
       - name: Check out release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: Mnehmos/mnehmos.worksheet.app
-          ref: ${{ inputs.source_sha }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
           persist-credentials: false
-          fetch-depth: 0
+      - name: Load the encrypted reviewed source capsule
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ARCHIVE_KEY: ${{ secrets.SOURCE_ARCHIVE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source-capsule"
+          gh release download "$SOURCE_TAG" --repo Mnehmos/provecalc-releases --pattern Source.enc --dir "$RUNNER_TEMP/source-capsule"
+          python scripts/decrypt_release_source.py --capsule "$RUNNER_TEMP/source-capsule/Source.enc" --sha256 "$SOURCE_CAPSULE_SHA256" --source-sha "$SOURCE_SHA"
 
       - name: Generate release-revision SPDX SBOM
         uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
@@ -483,6 +473,8 @@ jobs:
           find release-assets -maxdepth 1 -type f \
             \( -name 'ProveCalc_*_SHA256SUMS.txt' \
                -o -name 'ProveCalc_*_provenance.intoto.json' \
+               -o -name 'ProveCalc_*_build.json' \
+               -o -name '*.sig' \
                -o -name 'ProveCalc_*_sbom.spdx.json' \) \
             -delete
 
@@ -492,138 +484,11 @@ jobs:
             --expected-syft-version 1.42.3
           mv release-sbom.spdx.json "$SBOM_PATH"
 
-      - name: Generate checksums and source provenance
-        run: |
-          TAG="${{ inputs.source_tag }}"
-          python scripts/generate_release_provenance.py \
-            --artifacts-dir release-assets \
-            --output-dir release-metadata \
-            --version "${TAG#v}" \
-            --source-revision "$SOURCE_SHA" \
-            --source-ref "refs/tags/$SOURCE_TAG" \
-            --repository "Mnehmos/mnehmos.worksheet.app" \
-            --builder-repository "$GITHUB_REPOSITORY" \
-            --workflow-ref "$GITHUB_WORKFLOW_REF" \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT"
-
-      - name: Upload release security metadata
-        shell: bash
+      - name: Bind all unsigned binaries to this build invocation
         env:
-          PUBLIC_RELEASE_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.source_tag }}"
-          VERSION="${TAG#v}"
-          GH_TOKEN="$PUBLIC_RELEASE_TOKEN" gh release upload "$TAG" \
-            "release-assets/ProveCalc_${VERSION}_sbom.spdx.json" \
-            "release-metadata/ProveCalc_${VERSION}_provenance.intoto.json" \
-            "release-metadata/ProveCalc_${VERSION}_SHA256SUMS.txt" \
-            --repo Mnehmos/provecalc-releases \
-            --clobber
-
-  publish-release:
-    permissions:
-      contents: write
-    name: Publish Updater Manifest and Release
-    needs: [build, publish-metadata]
-    runs-on: ubuntu-latest
-    environment: release
-    timeout-minutes: 20
-    steps:
-      - name: Check out release source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: Mnehmos/mnehmos.worksheet.app
-          ref: ${{ inputs.source_sha }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
-          persist-credentials: false
-          fetch-depth: 0
-
-      - name: Generate latest.json from the signed artifacts
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          TAG="${{ inputs.source_tag }}"
-          mkdir -p signatures
-          gh release download "$TAG" \
-            --repo Mnehmos/provecalc-releases \
-            --pattern 'ProveCalc_*.sig' \
-            --dir signatures
-          python3 scripts/updater_release.py manifest \
-            --version "${TAG#v}" \
-            --base-url "https://github.com/Mnehmos/provecalc-releases/releases/download/${TAG}" \
-            --signatures-dir signatures \
-            --changelog CHANGELOG.md \
-            --output latest.json \
-            --notes-output release-notes.md
-
-      - name: Upload latest.json to the draft
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release upload "${{ inputs.source_tag }}" latest.json \
-            --repo Mnehmos/provecalc-releases \
-            --clobber
-
-      - name: Install minisign for updater signature verification
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y minisign
-
-      - name: Validate the complete draft before publishing
-        # Re-verifies what customers will download: every updater artifact
-        # against the public key the installed apps trust, latest.json, the
-        # installer inventory, checksums, and provenance for this run.
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          TAG="${{ inputs.source_tag }}"
-          gh release view "$TAG" \
-            --repo Mnehmos/provecalc-releases \
-            --json isDraft,assets > release-assets.json
-          if [[ "$(jq -r '.isDraft' release-assets.json)" != "true" ]]; then
-            echo "Release $TAG is no longer a draft at the publication gate." >&2
-            exit 1
-          fi
-          mkdir -p release-assets
-          gh release download "$TAG" \
-            --repo Mnehmos/provecalc-releases \
-            --pattern 'ProveCalc*' \
-            --pattern 'latest.json' \
-            --dir release-assets
-          python3 -c "import base64,json,pathlib; pathlib.Path('updater.pub').write_bytes(base64.b64decode(json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text())['plugins']['updater']['pubkey']))"
-          python3 scripts/validate_release_assets.py \
-            --asset-json release-assets.json \
-            --assets-dir release-assets \
-            --version "${TAG#v}" \
-            --source-sha "$SOURCE_SHA" \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --updater-public-key updater.pub
-
-      - name: Publish the release
-        if: inputs.publish
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          TAG="${{ inputs.source_tag }}"
-          # Publishing last means releases/latest, and therefore every
-          # installed updater, only moves once the manifest is complete.
-          # Tags with a pre-release suffix (v0.1.8-1) publish as
-          # pre-releases, which releases/latest ignores, so a candidate can
-          # be verified without offering it to installed apps.
-          if [[ "$TAG" == *-* ]]; then
-            channel=(--prerelease --latest=false)
-          else
-            channel=(--prerelease=false --latest)
-          fi
-          gh release edit "$TAG" \
-            --repo Mnehmos/provecalc-releases \
-            --notes-file release-notes.md \
-            --draft=false \
-            "${channel[@]}"
+          python scripts/stage_unsigned_release.py --record release-assets --out "ProveCalc_${SOURCE_TAG#v}_build.json"
+          gh release upload "$SOURCE_TAG" "release-assets/ProveCalc_${SOURCE_TAG#v}_sbom.spdx.json" "ProveCalc_${SOURCE_TAG#v}_build.json" --repo Mnehmos/provecalc-releases --clobber
+          echo "Unsigned draft is complete. Signing and publication require the private local release workflow."
