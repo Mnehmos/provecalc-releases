@@ -32,6 +32,9 @@ jobs:
   source-identity:
     if: github.ref == 'refs/heads/main'
     environment: release
+    # Draft releases are invisible to read-only tokens; this job only downloads the capsule.
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -59,6 +62,9 @@ jobs:
 
   release-checks:
     environment: release
+    # Draft releases are invisible to read-only tokens; this job only downloads the capsule.
+    permissions:
+      contents: write
     name: Release Consistency
     needs: [source-identity]
     runs-on: ubuntu-latest
@@ -86,6 +92,9 @@ jobs:
 
   frontend-tests:
     environment: release
+    # Draft releases are invisible to read-only tokens; this job only downloads the capsule.
+    permissions:
+      contents: write
     name: Frontend Tests
     needs: [source-identity]
     runs-on: ubuntu-latest
@@ -130,6 +139,9 @@ jobs:
 
   rust-tests:
     environment: release
+    # Draft releases are invisible to read-only tokens; this job only downloads the capsule.
+    permissions:
+      contents: write
     name: Rust Tests
     needs: [source-identity]
     runs-on: ubuntu-latest
@@ -196,6 +208,9 @@ jobs:
 
   python-tests:
     environment: release
+    # Draft releases are invisible to read-only tokens; this job only downloads the capsule.
+    permissions:
+      contents: write
     name: Python Tests
     needs: [source-identity]
     runs-on: ubuntu-latest
